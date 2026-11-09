@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for an offline-only Android PWA video compressor with HandBrake-style controls, quick presets, batch processing, custom resolution, and sequential saving.",
+  "updatedAt":  "2026-11-09T20:29:00.423789378Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

@@ -1,0 +1,6 @@
+{
+  "name": "HandPress - Offline Video Compressor",
+  "description": "Free, offline video compressor for Android with HandBrake-style controls, custom resolution, quick social presets, batch processing, and auto-export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
