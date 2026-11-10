@@ -1,0 +1,177 @@
+name: CI
+# Delivery pipeline of the platform (infrastructure#321, rulings #320 and #314). PR CI and the image publish run on
+# GitHub-hosted runners (this repository is public); only deploy-staging runs on util01.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-main-{0}-{1}', github.sha, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with: { persist-credentials: false }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with: { bun-version: 1.4.4 }
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with: { persist-credentials: false }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with: { bun-version: 1.4.4 }
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: node scripts/write-health.mjs "$GITHUB_SHA"
+      - name: Artifact and entry tests
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=junit.xml tests/*.test.mjs
+      - name: Test gate
+        run: node .github/scripts/test-gate.mjs junit.xml
+
+  ci-ok:
+    needs: [lint, build-test]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ needs.lint.result }} ${{ needs.build-test.result }}
+        run: |
+          echo "results: $RESULTS"
+          [ "$RESULTS" = "success success" ]
+
+  image:
+    needs: [ci-ok]
+    if: always() && needs.ci-ok.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with: { persist-credentials: false }
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Short sha
+        id: short
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: push
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/bahadirbirsoz/bahadirbirsoz-handpress:sha-${{ steps.short.outputs.short }}
+          build-args: GIT_SHA=${{ github.sha }}
+      - name: Digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "image-digest=$DIGEST"
+
+  deploy-staging:
+    needs: [ci-ok, image]
+    if: always() && needs.ci-ok.result == 'success' && needs.image.result == 'success' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, util01-deploy]
+    timeout-minutes: 15
+    environment: staging
+    concurrency:
+      group: deploy-util01
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+      deployments: write
+    env:
+      DIGEST: ${{ needs.image.outputs.digest }}
+      TOKEN: ${{ github.token }}
+      KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+      DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+    steps:
+      - name: Validate the inputs
+        run: |
+          set -eu
+          printf '%s' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "bad digest"; exit 1; }
+          printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "bad sha"; exit 1; }
+      - name: Set up ssh (run-scoped)
+        run: |
+          set -eu
+          d=$(mktemp -d "$RUNNER_TEMP/ssh.XXXXXX")
+          printf '%s\n' "$KEY" > "$d/k"
+          chmod 600 "$d/k"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$d/kh"
+          echo "SSHDIR=$d" >> "$GITHUB_ENV"
+          # The one GitHub API helper both later steps source: the token goes to curl on stdin, never argv (no secret in the file).
+          cat > "$d/api.sh" <<'APIEOF'
+          api() { # api <method> <path> [json body]
+            printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fsS -K - --max-time 20 -X "$1" -H 'Accept: application/vnd.github+json' ${3:+-H 'Content-Type: application/json' -d "$3"} "https://api.github.com/repos/$GITHUB_REPOSITORY$2"
+          }
+          APIEOF
+      - name: Never regress
+        run: |
+          set -eu
+          . "$SSHDIR/api.sh"
+          ssh_() { ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSHDIR/k" -o UserKnownHostsFile="$SSHDIR/kh" -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$DEPLOY_USER@$DEPLOY_HOST" "$@"; }
+          running=$(curl -fsS --max-time 10 https://handpress.staging.birsoz.net/health 2>/dev/null | jq -r '.sha // empty' 2>/dev/null || true)
+          if ! printf '%s' "$running" | grep -Eq '^[0-9a-f]{40}$'; then
+            tag=$(ssh_ read-tag < /dev/null)
+            running=${tag%% *}
+          fi
+          if ! printf '%s' "$running" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "no running sha (first deploy)"
+            exit 0
+          fi
+          status=$(api GET "/compare/$running...$GITHUB_SHA" | jq -r .status)
+          case $status in
+            ahead | identical) echo "running $running, $status: go on" ;;
+            behind | diverged) echo "superseded: $running is not an ancestor of $GITHUB_SHA ($status)"; echo "SUPERSEDED=1" >> "$GITHUB_ENV" ;;
+            *) echo "compare failed: $status"; exit 1 ;;
+          esac
+      - name: Deploy
+        if: env.SUPERSEDED != '1'
+        run: |
+          set -eu
+          printf '%s\n' "$TOKEN" | ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSHDIR/k" -o UserKnownHostsFile="$SSHDIR/kh" -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 "$DEPLOY_USER@$DEPLOY_HOST" "deploy $GITHUB_SHA $DIGEST"
+      - name: Public health reports the sha
+        if: env.SUPERSEDED != '1'
+        run: |
+          set -u
+          for _ in $(seq 1 60); do
+            got=$(curl -fsS --max-time 10 https://handpress.staging.birsoz.net/health 2>/dev/null | jq -r '.sha // empty' 2>/dev/null || true)
+            [ "$got" = "$GITHUB_SHA" ] && { echo "health reports $got"; exit 0; }
+            sleep 5
+          done
+          echo "health never reported $GITHUB_SHA (last: ${got:-none})"
+          exit 1
+      - name: Write the digest record
+        if: env.SUPERSEDED != '1'
+        run: |
+          set -eu
+          . "$SSHDIR/api.sh"
+          id=$(api GET "/deployments?environment=staging&sha=$GITHUB_SHA" | jq -r '[.[]|select(.creator.login=="github-actions[bot]")]|max_by(.id).id')
+          printf '%s' "$id" | grep -Eq '^[0-9]+$' || { echo "no deployment found for $GITHUB_SHA"; exit 1; }
+          api POST "/deployments/$id/statuses" "{\"state\":\"in_progress\",\"description\":\"digest=$DIGEST\"}" > /dev/null
+          n=$(api GET "/deployments/$id/statuses" | jq -r '[.[]|select(.description|test("^digest=sha256:[0-9a-f]{64}$"))]|length')
+          [ "$n" = 1 ] || { echo "expected exactly one digest status, found $n"; exit 1; }
+          echo "digest record written on deployment $id"
+      - name: Remove the ssh material
+        if: always()
+        run: |
+          if [ -n "${SSHDIR:-}" ] && [ -d "$SSHDIR" ]; then shred -u "$SSHDIR"/k 2>/dev/null || rm -f "$SSHDIR"/k; rm -rf "$SSHDIR"; fi

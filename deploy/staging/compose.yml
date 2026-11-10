@@ -1,0 +1,17 @@
+# Staging stack on util01 (infrastructure#321). One service, no published ports: the edge Caddy reaches it on the fixed
+# address of the external network edge_handpress_staging. The image is always a digest, passed in by deploy-entry.
+name: handpress-staging
+services:
+  web:
+    image: ${HANDPRESS_IMAGE:?}
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    labels: { infra.log-class: app }
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+    networks:
+      edge_handpress_staging: { ipv4_address: 172.29.7.10 }
+networks:
+  edge_handpress_staging: { external: true }
