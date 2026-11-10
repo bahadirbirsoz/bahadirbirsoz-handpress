@@ -88,6 +88,7 @@ jobs:
     needs: [ci-ok, image]
     if: always() && needs.ci-ok.result == 'success' && needs.image.result == 'success' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: [self-hosted, util01-deploy]
+    timeout-minutes: 15
     environment: staging
     concurrency:
       group: deploy-util01
@@ -117,9 +118,16 @@ jobs:
           chmod 600 "$d/k"
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$d/kh"
           echo "SSHDIR=$d" >> "$GITHUB_ENV"
+          # The one GitHub API helper both later steps source: the token goes to curl on stdin, never argv (no secret in the file).
+          cat > "$d/api.sh" <<'APIEOF'
+          api() { # api <method> <path> [json body]
+            printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fsS -K - --max-time 20 -X "$1" -H 'Accept: application/vnd.github+json' ${3:+-H 'Content-Type: application/json' -d "$3"} "https://api.github.com/repos/$GITHUB_REPOSITORY$2"
+          }
+          APIEOF
       - name: Never regress
         run: |
           set -eu
+          . "$SSHDIR/api.sh"
           ssh_() { ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSHDIR/k" -o UserKnownHostsFile="$SSHDIR/kh" -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$DEPLOY_USER@$DEPLOY_HOST" "$@"; }
           running=$(curl -fsS --max-time 10 https://handpress.staging.birsoz.net/health 2>/dev/null | jq -r '.sha // empty' 2>/dev/null || true)
           if ! printf '%s' "$running" | grep -Eq '^[0-9a-f]{40}$'; then
@@ -130,7 +138,7 @@ jobs:
             echo "no running sha (first deploy)"
             exit 0
           fi
-          status=$(curl -fsS --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$GITHUB_REPOSITORY/compare/$running...$GITHUB_SHA" | jq -r .status)
+          status=$(api GET "/compare/$running...$GITHUB_SHA" | jq -r .status)
           case $status in
             ahead | identical) echo "running $running, $status: go on" ;;
             behind | diverged) echo "superseded: $running is not an ancestor of $GITHUB_SHA ($status)"; echo "SUPERSEDED=1" >> "$GITHUB_ENV" ;;
@@ -140,7 +148,7 @@ jobs:
         if: env.SUPERSEDED != '1'
         run: |
           set -eu
-          printf '%s\n' "$TOKEN" | ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSHDIR/k" -o UserKnownHostsFile="$SSHDIR/kh" -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$DEPLOY_USER@$DEPLOY_HOST" "deploy $GITHUB_SHA $DIGEST"
+          printf '%s\n' "$TOKEN" | ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSHDIR/k" -o UserKnownHostsFile="$SSHDIR/kh" -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 "$DEPLOY_USER@$DEPLOY_HOST" "deploy $GITHUB_SHA $DIGEST"
       - name: Public health reports the sha
         if: env.SUPERSEDED != '1'
         run: |
@@ -156,9 +164,7 @@ jobs:
         if: env.SUPERSEDED != '1'
         run: |
           set -eu
-          api() { # api <method> <path> [json body]: the token goes to curl on stdin, never argv
-            printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fsS -K - --max-time 20 -X "$1" -H 'Accept: application/vnd.github+json' ${3:+-H 'Content-Type: application/json' -d "$3"} "https://api.github.com/repos/$GITHUB_REPOSITORY$2"
-          }
+          . "$SSHDIR/api.sh"
           id=$(api GET "/deployments?environment=staging&sha=$GITHUB_SHA" | jq -r '[.[]|select(.creator.login=="github-actions[bot]")]|max_by(.id).id')
           printf '%s' "$id" | grep -Eq '^[0-9]+$' || { echo "no deployment found for $GITHUB_SHA"; exit 1; }
           api POST "/deployments/$id/statuses" "{\"state\":\"in_progress\",\"description\":\"digest=$DIGEST\"}" > /dev/null

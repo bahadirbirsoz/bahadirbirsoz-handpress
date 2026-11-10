@@ -27,7 +27,7 @@ const TARGETS = [
   [/^PATH=\/usr\/local\/sbin.*$/m, (w) => `PATH=${w}/bin`],
 ];
 
-function harness({prev = null, healthy = true} = {}) {
+function harness({prev = null, healthy = true, prevHealthy = true} = {}) {
   const w = mkdtempSync(join(tmpdir(), 'hp-entry-'));
   for (const d of ['bin', 'stack', 'cfg', 'state']) mkdirSync(join(w, d));
   writeFileSync(join(w, 'INSTALLED'), 'installed\n');
@@ -44,7 +44,7 @@ function harness({prev = null, healthy = true} = {}) {
   }
   // answers: which sha each image digest reports on /health
   const answers = [`${DIG} ${healthy ? SHA : 'f'.repeat(40)}`];
-  if (prev) answers.push(`${prev.digest} ${prev.sha}`);
+  if (prev) answers.push(`${prev.digest} ${prevHealthy ? prev.sha : 'e'.repeat(40)}`);
   writeFileSync(join(w, 'state/answers'), answers.join('\n') + '\n');
   const fake = `#!/bin/bash
 S=${w}/state
@@ -179,5 +179,63 @@ test('E7 read-tag prints the last good pair, or none', () => {
 test('E8 the entry holds each rewritten line once and no environment hook', () => {
   for (const [re] of TARGETS) assert.equal(original.match(new RegExp(re.source, 'gm'))?.length, 1, String(re));
   assert.ok(!/\$\{(HANDPRESS_|ENTRY_)/.test(original));
-  assert.ok(!/docker compose[^\n]*down[^\n]* -v/.test(original));
+  assert.ok(!/\bdown\b[^\n]*(?: -v|--volumes)/.test(original));
+});
+
+test('E9 the token is gone before anything starts: logout precedes the first up', () => {
+  const w = harness();
+  assert.equal(run(w, deployCmd).status, 0);
+  const lines = dockerLog(w).trim().split('\n');
+  const out = lines.findIndex((l) => l.startsWith('logout'));
+  const up = lines.findIndex((l) => / up /.test(` ${l} `));
+  assert.ok(out >= 0 && up >= 0 && out < up, `logout at ${out}, first up at ${up}`);
+});
+
+test('E10 the restore also fails: down without -v, exit 3, restore failed logged, deployed.json untouched', () => {
+  const w = harness({prev: {sha: PREV, digest: PDIG}, healthy: false, prevHealthy: false});
+  const before = read(w, 'stack/deployed.json');
+  const r = run(w, deployCmd);
+  assert.equal(r.status, 3, r.stderr);
+  const downs = dockerLog(w).split('\n').filter((l) => / down( |$)/.test(l));
+  assert.equal(downs.length, 1);
+  assert.ok(downs[0].includes(`@${PDIG}`), 'down not on the previous digest');
+  assert.ok(!/ -v/.test(downs[0]) && !/--volumes/.test(downs[0]));
+  assert.match(logger(w), /restore failed/);
+  assert.equal(read(w, 'stack/deployed.json'), before);
+  assert.deepEqual(runDirs(w), []);
+});
+
+test('E11 a docker-credential-* helper on PATH is refused before docker runs', () => {
+  const w = harness();
+  writeFileSync(join(w, 'bin/docker-credential-fake'), '#!/bin/bash\nexit 0\n');
+  chmodSync(join(w, 'bin/docker-credential-fake'), 0o755);
+  const r = run(w, deployCmd);
+  assert.equal(r.status, 111, r.stderr);
+  assert.match(logger(w), /refused: credential helper on PATH/);
+  assert.equal(dockerLog(w), '');
+});
+
+// The U18 hook row admits every job of ci.yml on a push to main, so the routing is what keeps repository and third-party
+// code off the deploy host: only deploy-staging may use the self-hosted runner, and it may have no `uses:` step.
+test('E12 only deploy-staging runs self-hosted, and it uses no actions', () => {
+  const yml = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8').split('\n');
+  const start = yml.findIndex((l) => l === 'jobs:');
+  assert.ok(start >= 0, 'no jobs:');
+  const jobs = {};
+  let cur = null;
+  for (const l of yml.slice(start + 1)) {
+    const m = l.match(/^ {2}"?([\w-]+)"?:\s*$/);
+    if (m) { cur = m[1]; jobs[cur] = []; } else if (cur) jobs[cur].push(l);
+  }
+  assert.ok(jobs['deploy-staging'], 'no deploy-staging job');
+  assert.ok(Object.keys(jobs).length >= 4, 'job parse found too few jobs');
+  for (const [name, body] of Object.entries(jobs)) {
+    const runsOn = body.filter((l) => /^ {4}runs-on:/.test(l)).join('\n');
+    assert.ok(runsOn, `${name} has no runs-on`);
+    if (name !== 'deploy-staging') assert.ok(!/self-hosted/.test(runsOn), `${name} runs on a self-hosted runner`);
+    else {
+      assert.match(runsOn, /self-hosted/);
+      assert.ok(!body.some((l) => /^\s*-?\s*uses:/.test(l)), 'deploy-staging has a uses: step');
+    }
+  }
 });
