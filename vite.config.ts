@@ -43,6 +43,9 @@ export default defineConfig(() => {
             },
           ],
         },
+        workbox: {
+          navigateFallbackDenylist: [/^\/health$/],
+        },
         devOptions: {
           enabled: true,
           type: 'module',
