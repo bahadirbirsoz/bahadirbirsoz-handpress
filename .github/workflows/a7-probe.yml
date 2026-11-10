@@ -1,0 +1,10 @@
+# Throwaway refusal probe for infrastructure#321 A7. Never merged.
+name: a7-probe
+on: pull_request
+permissions: {}
+jobs:
+  probe:
+    runs-on: [self-hosted, util01-deploy]
+    timeout-minutes: 5
+    steps:
+      - run: echo "this step must never run"
