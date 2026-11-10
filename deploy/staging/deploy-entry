@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Forced-command entry for the staging deploy account. Installed root-owned at /srv/handpress/deploy-entry; sshd runs it as
+# `deploy-entry staging` whatever the client asked for. The client's command arrives in SSH_ORIGINAL_COMMAND and is matched
+# as a whole against two shapes; nothing from the wire reaches a shell.
+#   deploy <sha40> <sha256:digest>   (one ghs_ token line on stdin)
+#   read-tag                         prints "<sha40> <digest>" of the last good deploy, or "none"
+# Exit: 0 deployed, 1 pull failed or the previous deploy was restored, 3 failed and the stack is stopped, 111 refused.
+set -uo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH LC_ALL=C
+for v in $(compgen -e); do case $v in DOCKER_* | COMPOSE_* | BASH_ENV | ENV) unset "$v" ;; esac; done
+
+readonly STACK=/srv/handpress/staging
+readonly INSTALLED=/srv/handpress/INSTALLED
+readonly CFGPARENT=/srv/handpress/.docker
+readonly IMAGE_REPO=ghcr.io/bahadirbirsoz/bahadirbirsoz-handpress
+readonly PROJECT=handpress-staging
+readonly WAIT_S=120
+readonly POLL_S=2
+
+TAG=handpress-staging-entry
+refuse() { logger -t "$TAG" -p auth.warning "refused: $1"; exit 111; }
+log() { logger -t "$TAG" -p auth.notice "$*"; }
+
+[ "${1:-}" = staging ] || refuse "environment argument"
+cmd=${SSH_ORIGINAL_COMMAND-}
+re_deploy='^deploy ([0-9a-f]{40}) (sha256:[0-9a-f]{64})$'
+
+if [ "$cmd" = read-tag ]; then
+  out=$(sed -n 's/^{"sha":"\([0-9a-f]\{40\}\)","digest":"\(sha256:[0-9a-f]\{64\}\)".*$/\1 \2/p' "$STACK/deployed.json" 2>/dev/null | head -n 1)
+  printf '%s\n' "${out:-none}"
+  exit 0
+fi
+[[ $cmd =~ $re_deploy ]] || refuse "command"
+sha=${BASH_REMATCH[1]}
+digest=${BASH_REMATCH[2]}
+
+# 1. The token: one bounded line, nothing after it.
+token=
+IFS= read -r -n 8192 token || [ -n "$token" ] || refuse "no token"
+[[ $token =~ ^ghs_[A-Za-z0-9._-]{36,4096}$ ]] || refuse "token shape"
+if IFS= read -r -t 1 -n 1 _extra; then refuse "extra input after the token"; fi
+
+# 2. The installed tree.
+[ -f "$INSTALLED" ] || refuse "not installed"
+[ -f "$STACK/compose.yml" ] && [ ! -L "$STACK/compose.yml" ] || refuse "compose file"
+# 3. A credential helper would take the token out of the per-run configuration.
+[ -z "$(compgen -c docker-credential- 2>/dev/null)" ] || refuse "credential helper on PATH"
+
+# 4. The previous deploy.
+prev_sha=
+prev_digest=
+if [ -f "$STACK/deployed.json" ]; then
+  line=$(sed -n 's/^{"sha":"\([0-9a-f]\{40\}\)","digest":"\(sha256:[0-9a-f]\{64\}\)".*$/\1 \2/p' "$STACK/deployed.json" | head -n 1)
+  prev_sha=${line%% *}
+  prev_digest=${line#* }
+  [ -n "$line" ] || { prev_sha=; prev_digest=; }
+fi
+
+dc() { # dc <digest> <compose args...>: the project, the file and the image digest are fixed here
+  local d=$1
+  shift
+  env -i PATH="$PATH" HOME="${HOME:-/}" ${DOCKERCFG:+DOCKER_CONFIG="$DOCKERCFG"} HANDPRESS_IMAGE="$IMAGE_REPO@$d" \
+    docker compose -p "$PROJECT" -f "$STACK/compose.yml" "$@"
+}
+
+wait_sha() { # wait_sha <sha40> <digest>
+  local want=$1 end out
+  end=$((SECONDS + WAIT_S))
+  while :; do
+    out=$(dc "$2" exec -T web wget -qO- -T 3 http://127.0.0.1:8080/health 2>/dev/null) || out=
+    case $out in *"\"sha\":\"$want\""*) return 0 ;; esac
+    [ "$SECONDS" -ge "$end" ] && return 1
+    sleep "$POLL_S"
+  done
+}
+
+DOCKERCFG=
+cleanup() {
+  if [ -n "$DOCKERCFG" ]; then
+    env -i PATH="$PATH" HOME="${HOME:-/}" DOCKER_CONFIG="$DOCKERCFG" docker logout ghcr.io >/dev/null 2>&1
+    rm -rf "$DOCKERCFG"
+    DOCKERCFG=
+  fi
+}
+
+run_deploy() {
+  trap cleanup EXIT
+  # Per-run Docker configuration: the token lives only in this directory, and only until the pull is done.
+  find "$CFGPARENT" -maxdepth 1 -name 'run.*' -mmin +60 -exec rm -rf {} + 2>/dev/null
+  DOCKERCFG=$(mktemp -d "$CFGPARENT/run.XXXXXXXX") || { log "no config dir"; return 1; }
+  if ! printf '%s' "$token" | env -i PATH="$PATH" HOME="${HOME:-/}" DOCKER_CONFIG="$DOCKERCFG" \
+    docker login ghcr.io -u github-actions --password-stdin >/dev/null 2>&1; then
+    log "login failed $sha"
+    return 1
+  fi
+  if ! dc "$digest" pull web >/dev/null 2>&1; then
+    log "pull failed $sha"
+    return 1
+  fi
+  cleanup # the token is gone before anything starts
+
+  ok=1
+  dc "$digest" up -d --no-build --pull never >/dev/null 2>&1 || ok=0
+  [ "$ok" = 1 ] && { wait_sha "$sha" "$digest" || ok=0; }
+  if [ "$ok" = 1 ]; then
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [ -n "$prev_sha" ]; then prev="{\"sha\":\"$prev_sha\",\"digest\":\"$prev_digest\"}"; else prev=null; fi
+    printf '{"sha":"%s","digest":"%s","at":"%s","previous":%s}\n' "$sha" "$digest" "$now" "$prev" > "$STACK/.deployed.json.new" \
+      && mv -f "$STACK/.deployed.json.new" "$STACK/deployed.json" || { log "deployed.json not written $sha"; return 3; }
+    log "deployed $sha $digest"
+    return 0
+  fi
+
+  if [ -n "$prev_sha" ]; then
+    if dc "$prev_digest" up -d --no-build --pull never >/dev/null 2>&1 && wait_sha "$prev_sha" "$prev_digest"; then
+      log "restored $prev_sha"
+      return 1
+    fi
+    dc "$prev_digest" down >/dev/null 2>&1
+    log "deploy failed $sha; restore failed"
+    return 3
+  fi
+  dc "$digest" down >/dev/null 2>&1
+  log "deploy failed $sha; no previous deploy, stack stopped"
+  return 3
+}
+
+# A dropped session must not leave the stack half-changed: ignore the hangup, let the run finish and clean up.
+trap '' HUP INT TERM
+run_deploy &
+wait $!
+exit $?
